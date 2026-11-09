@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>ПСБ Юридический Ассистент</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 h-screen flex flex-col">
+  <!-- Шапка в цветах ПСБ -->
+  <header class="bg-blue-950 text-white px-6 py-3 flex items-center justify-between shadow">
+    <div class="flex items-center gap-3">
+      <span class="text-2xl">🐻⚖️</span>
+      <div>
+        <h1 class="font-bold text-lg">ПСБ Правовой Ассистент</h1>
+        <p class="text-xs text-orange-400">Система верифицированного поиска с контролем достоверности (GraphRAG + CRAG)</p>
+      </div>
+    </div>
+  </header>
+
+  <!-- Основной Split-Screen экран -->
+  <main class="flex-1 grid grid-cols-12 gap-4 p-4 overflow-hidden">
+    <!-- Левая колонка: Чат (7 колонок) -->
+    <section class="col-span-7 bg-white rounded-xl shadow flex flex-col overflow-hidden">
+      <div id="chat-box" class="flex-1 p-4 overflow-y-auto space-y-4">
+        <div class="bg-blue-50 border border-blue-200 p-3 rounded-lg text-sm text-slate-700">
+          Здравствуйте! Задайте вопрос по нормативной базе или договорам. Я приведу ссылки на действующие редакции или прямо сообщу, если данных в базе недостаточно.
+        </div>
+      </div>
+
+      <!-- Поле ввода -->
+      <form id="chat-form" class="p-3 border-t flex gap-2 bg-slate-50">
+        <input id="user-input" type="text" required placeholder="Например: Какие документы проверить при согласовании договора поставки?"
+               class="flex-1 border rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-900">
+        <button type="submit" class="bg-orange-500 hover:bg-orange-600 text-white font-medium px-5 py-2 rounded-lg text-sm">
+          Отправить
+        </button>
+      </form>
+    </section>
+
+    <!-- Правая колонка: Просмотр документа и подсветка фрагментов (5 колонок) -->
+    <section class="col-span-5 bg-white rounded-xl shadow flex flex-col overflow-hidden">
+      <div class="p-3 border-b bg-slate-50 flex justify-between items-center">
+        <h2 id="doc-title" class="font-semibold text-sm text-slate-800">📄 Просмотр подтверждающего документа</h2>
+        <span id="doc-match" class="text-xs text-slate-500">Выберите источник под ответом</span>
+      </div>
+      <div id="doc-viewer" class="flex-1 p-4 overflow-y-auto text-sm leading-relaxed space-y-3 text-slate-700">
+        <p class="text-slate-400 italic">Нажмите на любую плашку источника под ответом ассистента, чтобы открыть документ и подсветить подтверждающее положение.</p>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const chatBox = document.getElementById('chat-box');
+    const chatForm = document.getElementById('chat-form');
+    const userInput = document.getElementById('user-input');
+    const docViewer = document.getElementById('doc-viewer');
+    const docTitle = document.getElementById('doc-title');
+    const docMatch = document.getElementById('doc-match');
+
+    let messages = [];
+
+    const statusBadges = {
+      "CONFIRMED": { text: "Подтверждено базой знаний", cls: "bg-emerald-100 text-emerald-800 border-emerald-300" },
+      "PARTIAL": { text: "Частично подтверждено (недостаток данных)", cls: "bg-amber-100 text-amber-800 border-amber-300" },
+      "REFUSAL_OLD_LAW": { text: "Отказ: запрошена старая редакция закона", cls: "bg-red-100 text-red-800 border-red-300" },
+      "PREMISE_ERROR": { text: "Внимание: ошибка в предпосылке вопроса", cls: "bg-purple-100 text-purple-800 border-purple-300" },
+      "OUT_OF_DOMAIN": { text: "Отказ: нет данных в базе / вне компетенции", cls: "bg-slate-200 text-slate-800 border-slate-400" }
+    };
+
+    chatForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = userInput.value.trim();
+      if (!text) return;
+
+      messages.push({ role: "user", content: text });
+      chatBox.innerHTML += `<div class="flex justify-end"><div class="bg-blue-950 text-white px-4 py-2 rounded-lg max-w-xl text-sm">${text}</div></div>`;
+      userInput.value = '';
+      chatBox.scrollTop = chatBox.scrollHeight;
+
+      const loadingId = "load-" + Date.now();
+      chatBox.innerHTML += `<div id="${loadingId}" class="text-xs text-slate-400 italic">🐻 Проверяю редакции документов и сверяю нормы...</div>`;
+
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages })
+      });
+      const data = await res.json();
+      document.getElementById(loadingId).remove();
+
+      messages.push({ role: "assistant", content: data.answer });
+      const badge = statusBadges[data.status] || statusBadges["CONFIRMED"];
+
+      // Кнопки цитат для открытия документа справа
+      let citationsHtml = data.citations.map(c =>
+        `<button onclick='openDoc(${JSON.stringify(c.doc_id)}, ${JSON.stringify(c.quote)}, ${JSON.stringify(c.doc_title + " (" + c.clause + ")")})'
+                 class="text-xs bg-blue-50 hover:bg-blue-100 text-blue-900 border border-blue-300 px-2.5 py-1 rounded transition">
+           📑 ${c.doc_title} — ${c.clause}
+         </button>`
+      ).join(' ');
+
+      chatBox.innerHTML += `
+        <div class="border rounded-xl p-4 bg-slate-50 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-semibold px-2.5 py-0.5 rounded border ${badge.cls}">${badge.text}</span>
+            <span class="text-xs text-slate-400">Достоверность: ${(data.confidence * 100).toFixed(0)}%</span>
+          </div>
+          <div class="text-sm text-slate-800 whitespace-pre-line">${data.answer}</div>
+          ${citationsHtml ? `<div class="pt-2 border-t flex flex-wrap gap-1.5">${citationsHtml}</div>` : ''}
+        </div>`;
+      chatBox.scrollTop = chatBox.scrollHeight;
+    });
+
+    async function openDoc(docId, quote, title) {
+      docTitle.textContent = "📄 " + title;
+      const res = await fetch(`/api/document/${encodeURIComponent(docId)}?highlight_quote=${encodeURIComponent(quote)}`);
+      const data = await res.json();
+      docMatch.textContent = data.highlight_index >= 0 ? `Найдено совпадение (${data.match_score.toFixed(0)}%)` : '';
+
+      docViewer.innerHTML = data.paragraphs.map((p, idx) =>
+        idx === data.highlight_index
+          ? `<p id="highlighted-chunk" class="bg-yellow-200 border-l-4 border-orange-500 p-2 rounded font-medium text-slate-900">${p}</p>`
+          : `<p>${p}</p>`
+      ).join('');
+
+      const el = document.getElementById('highlighted-chunk');
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  </script>
+</body>
+</html>
