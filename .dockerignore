@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+.git
+.env
+submission.csv
+local_eval_report.csv
+data/
+knowledge_base/
