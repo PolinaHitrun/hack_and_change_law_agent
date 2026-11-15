@@ -1,3 +1,4 @@
+# agent.py
 import os
 import json
 import re
@@ -5,7 +6,6 @@ from openai import OpenAI
 from schemas import AgentResponse, Citation
 from prompts import ROUTER_SYSTEM_PROMPT, GENERATOR_SYSTEM_PROMPT
 
-# Импортируем класс Полины (он называется LegalRetriever в её коде)
 try:
     from retriever import LegalRetriever
 except ImportError:
@@ -15,14 +15,17 @@ class LegalAssistantAgent:
     def __init__(self, retriever=None):
         base_url = os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL")
         api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "dummy"
-        self.model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "deepseek-v4.1-flash"
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
         
-        # Инициализируем ретривер Полины
+        self.model = (
+            os.getenv("LLM_MODEL") 
+            or os.getenv("OPENAI_MODEL") 
+            or os.getenv("GEN_MODEL") 
+            or "deepseek-v4.1-flash"
+        )
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.retriever = retriever or (LegalRetriever() if LegalRetriever else None)
 
     def _parse_json(self, text: str) -> dict:
-        """Очистка ответа нейросети от markdown и парсинг JSON"""
         text = re.sub(r'```json', '', text)
         text = re.sub(r'```', '', text)
         start = text.find('{')
@@ -35,7 +38,6 @@ class LegalAssistantAgent:
         return {}
 
     def analyze_query(self, raw_text: str) -> dict:
-        """Роутер (Шаг 1)"""
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
@@ -49,16 +51,18 @@ class LegalAssistantAgent:
             return self._parse_json(resp.choices[0].message.content)
         except Exception as e:
             print(f"Router Error: {e}")
-            return {"standalone_query": raw_text, "is_safe": True, "target_date": None, "claims_to_check": []}
+            return {
+                "standalone_query": raw_text, 
+                "is_safe": True, 
+                "target_date": None, 
+                "entities": [], 
+                "claims_to_check": []
+            }
 
     def answer_from_messages(self, messages: list) -> AgentResponse:
-        """Главный метод для работы с фронтендом (вызывается из app.py)"""
-        
-        # Склеиваем историю диалога
         raw_question = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
-        
-        # 1. Роутер
         route = self.analyze_query(raw_question)
+        
         if not route.get("is_safe", True):
             return AgentResponse(
                 answer="Я являюсь корпоративным юридическим ассистентом и могу отвечать только на правовые вопросы в рамках предоставленной базы знаний.",
@@ -69,17 +73,27 @@ class LegalAssistantAgent:
         standalone_query = route.get("standalone_query", raw_question)
         target_date = route.get("target_date")
         claims = route.get("claims_to_check", [])
+        
+        entities = route.get("entities", [])
 
-        # 2. Поиск документов (вызов метода Полины)
         chunks = []
         if self.retriever:
             try:
-                # Полина возвращает просто список чанков (не кортеж!)
-                chunks = self.retriever.retrieve(query=standalone_query, target_date=target_date)
+                try:
+                    chunks = self.retriever.retrieve(query=standalone_query, target_date=target_date, entities=entities)
+                except TypeError:
+                    chunks = self.retriever.retrieve(query=standalone_query, target_date=target_date)
             except Exception as e:
                 print(f"Retriever Error: {e}")
 
-        # 3. Упаковка в теги
+        # ФИКС: Умный отказ (если Полина ничего не нашла, не тратим токены на генератор)
+        if not chunks:
+            return AgentResponse(
+                answer="На основе предоставленной базы знаний невозможно ответить на вопрос. В базе отсутствуют документы, регулирующие данную ситуацию.",
+                status="OUT_OF_DOMAIN",
+                confidence=1.0
+            )
+
         evidence_blocks = []
         for i, ch in enumerate(chunks):
             evidence_blocks.append(
@@ -94,10 +108,9 @@ class LegalAssistantAgent:
             f"Уточненный вопрос: {standalone_query}\n"
             f"Целевая дата проверки редакции: {target_date or 'Действующая на сегодня'}\n"
             f"Утверждения пользователя для проверки: {claims}\n\n"
-            f"Документы из базы знаний:\n{evidence_str if evidence_str else 'ДОКУМЕНТЫ НЕ НАЙДЕНЫ'}"
+            f"Документы из базы знаний:\n{evidence_str}"
         )
 
-        # 4. Генерация ответа
         try:
             gen_resp = self.client.chat.completions.create(
                 model=self.model,
@@ -113,20 +126,27 @@ class LegalAssistantAgent:
             print(f"Generator Error: {e}")
             res_dict = {"answer": "Произошла ошибка при генерации ответа.", "status": "OUT_OF_DOMAIN", "confidence": 0.0}
 
-        # 5. Сборка Citations
         final_citations = []
         for cit in res_dict.get("citations", []):
+            doc_id = cit.get("doc_id", "")
+            quote = cit.get("quote", "")
+            
+            for ch in chunks:
+                if ch.get("doc_id") == doc_id:
+                    if not quote or quote.lower() not in ch.get("raw_text", "").lower():
+                        quote = ch.get("raw_text", "")[:200] + "..."
+                    break
+
             final_citations.append(
                 Citation(
-                    doc_id=cit.get("doc_id", ""),
+                    doc_id=doc_id,
                     doc_title=cit.get("doc_title", "Документ"),
                     clause=cit.get("clause", ""),
-                    quote=cit.get("quote", ""),
+                    quote=quote,
                     score=float(cit.get("score", 0.9))
                 )
             )
 
-        # 6. Возврат ответа
         return AgentResponse(
             answer=res_dict.get("answer", "Извините, не удалось сформулировать ответ."),
             status=res_dict.get("status", "CONFIRMED"),
@@ -137,19 +157,10 @@ class LegalAssistantAgent:
         )
 
     def get_raw_document_text(self, doc_id: str) -> str:
-        """
-        Восстановление полного текста документа из чанков Полины.
-        Это нужно для того, чтобы на сайте работала желтая подсветка (вызов из app.py).
-        """
         if not self.retriever or not hasattr(self.retriever, "chunks"):
             return "Текст документа недоступен (retriever не инициализирован)."
-        
-        # Собираем все чанки, относящиеся к этому документу
         doc_chunks = [c for c in self.retriever.chunks if c["doc_id"] == doc_id]
         if not doc_chunks:
             return None
-            
-        # Сортируем по порядку и склеиваем
         doc_chunks.sort(key=lambda x: x["chunk_index"])
-        full_text = "\n\n".join([c["raw_text"] for c in doc_chunks])
-        return full_text
+        return "\n\n".join([c["raw_text"] for c in doc_chunks])
