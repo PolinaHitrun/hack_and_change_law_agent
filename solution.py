@@ -5,6 +5,7 @@ import zipfile
 import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
 FALLBACK_ANSWER = (
     "На основе предоставленной базы знаний невозможно сформировать "
@@ -55,11 +56,25 @@ def ensure_knowledge_base(data_dir: Path, extract_to: Path) -> Path:
 
 
 def _call_agent(agent, question_text: str):
-    if hasattr(agent, "process_query"):
-        return agent.process_query(str(question_text))
     if hasattr(agent, "answer_from_messages"):
-        return agent.answer_from_messages([{"role": "user", "content": str(question_text)}])
-    raise RuntimeError("Agent has neither process_query nor answer_from_messages")
+        q_str = str(question_text).strip()
+        
+        # Проверяем, передала ли платформа готовый JSON-массив диалога
+        if q_str.startswith("[") and q_str.endswith("]"):
+            try:
+                messages = json.loads(q_str)
+                if isinstance(messages, list) and all(isinstance(m, dict) for m in messages):
+                    return agent.answer_from_messages(messages)
+            except Exception:
+                pass
+                
+        # Если это обычный текст, оборачиваем его в стандартный формат
+        return agent.answer_from_messages([{"role": "user", "content": q_str}])
+        
+    if hasattr(agent, "analyze_query"):
+        return agent.analyze_query(str(question_text))
+        
+    raise RuntimeError("Agent has neither analyze_query nor answer_from_messages")
 
 
 def process_single_row(agent, row_id, question_text: str, max_retries: int = 3) -> dict:
