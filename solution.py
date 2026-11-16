@@ -68,6 +68,7 @@ def process_single_row(agent, row_id, question_text: str, max_retries: int = 3) 
             res = _call_agent(agent, question_text)
             ans = (getattr(res, "answer", "") or "").strip()
             if ans:
+                print(f"[INFO] id={row_id} ({attempt+1}/{max_retries}): got answer ({len(ans)} chars)")
                 return {"id": row_id, "answer": ans[:9900]}
         except Exception as exc:
             wait_sec = 2 * (attempt + 1)

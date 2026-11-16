@@ -8,17 +8,23 @@ import numpy as np
 from typing import List, Dict, Any, Optional
 from rank_bm25 import BM25Okapi
 
-# Конфигурация прокси тестирующей системы (согласно п. 6-7 Технического регламента)
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")).rstrip("/")
-LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", "hackathon_key"))
+LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "http://localhost:8000/v1").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "hackathon_key"
 EMB_MODEL = os.getenv("EMB_MODEL", "BAAI/bge-m3")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-8B")
+TOP_K_ENV = int(os.getenv("TOP_K", "16"))
+RERANKER_TOP_N_ENV = int(os.getenv("RERANKER_TOP_N", "8"))
 
 
 class LegalRetriever:
     def __init__(self, index_dir: str = "."):
         json_path = os.path.join(index_dir, "chunks_and_graph.json")
         faiss_path = os.path.join(index_dir, "faiss_index.bin")
+
+        # Автоматическая сборка индекса, если в тестовом контейнере перенесли только .py файлы (п. 4 Регламента)
+        if not (os.path.exists(json_path) and os.path.exists(faiss_path)):
+            import build_index
+            build_index.main(output_dir=index_dir)
 
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -29,7 +35,6 @@ class LegalRetriever:
 
         self.faiss_index = faiss.read_index(faiss_path)
 
-        # Инициализация лексического индекса BM25
         tokenized_corpus = [self._tokenize(c["contextual_text"]) for c in self.chunks]
         self.bm25 = BM25Okapi(tokenized_corpus)
 
@@ -42,7 +47,7 @@ class LegalRetriever:
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        """Токенизация с сохранением юридических идентификаторов (номера договоров, статьи, ИНН, суммы)."""
+        """Токенизация с сохранением юридических идентификаторов и квази-стеммингом для русского языка."""
         text_lower = text.lower().replace("ё", "е")
         tokens = re.findall(r"[а-яa-z0-9]+(?:[-/.][а-яa-z0-9]+)*", text_lower)
         expanded = []
@@ -51,10 +56,12 @@ class LegalRetriever:
             if "/" in t or "-" in t:
                 expanded.append(t.replace("/", "-"))
                 expanded.extend(re.split(r"[-/]", t))
+            # Добавляем префикс корня (5 букв) для улучшения полноты BM25 на русских падежах
+            if len(t) >= 6 and t.isalpha():
+                expanded.append(t[:5])
         return expanded
 
     def _post_with_retry(self, url: str, payload: Dict[str, Any], max_retries: int = 3, timeout: int = 20) -> Dict[str, Any]:
-        """Запрос к API платформы с защитой от 429 / 5xx и сетевых тайм-аутов."""
         for attempt in range(max_retries):
             try:
                 resp = requests.post(url, headers=self.headers, json=payload, timeout=timeout)
@@ -69,39 +76,37 @@ class LegalRetriever:
                 time.sleep(1.5 * (attempt + 1))
         return {}
 
-    def _get_embedding(self, text: str) -> np.ndarray:
-        data = self._post_with_retry(
-            self.emb_endpoint,
-            payload={"model": EMB_MODEL, "input": [text]}
-        )
-        vec = np.array(data["data"][0]["embedding"], dtype=np.float32)
-        norm = np.linalg.norm(vec)
-        return (vec / (norm if norm > 0 else 1e-9)).reshape(1, -1)
+    def _get_embedding(self, text: str) -> Optional[np.ndarray]:
+        try:
+            data = self._post_with_retry(
+                self.emb_endpoint,
+                payload={"model": EMB_MODEL, "input": [text]}
+            )
+            vec = np.array(data["data"][0]["embedding"], dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            return (vec / (norm if norm > 0 else 1e-9)).reshape(1, -1)
+        except Exception:
+            return None
 
     def retrieve(
         self,
         query: str,
         target_date: Optional[str] = None,
         entities: Optional[List[str]] = None,
-        top_k: int = 12,
-        final_k: int = 6,
+        top_k: int = TOP_K_ENV,
+        final_k: int = RERANKER_TOP_N_ENV,
         min_rerank_score: float = 0.15
     ) -> List[Dict[str, Any]]:
-        """
-        Боевой метод гибридного поиска и графового расширения:
-        1. Топ-12 по FAISS (BAAI/bge-m3) + Топ-12 по BM25.
-        2. Слияние через Reciprocal Rank Fusion (RRF).
-        3. Графовое расширение (AMENDS, VERSIONS, LAW_NOTES).
-        4. Реранкинг через Qwen3 Reranker 8B + отсечение шума по порогу CRAG (min_rerank_score).
-        """
         # 1. Векторный поиск (FAISS)
+        dense_hits = []
         q_emb = self._get_embedding(query)
-        _, faiss_indices = self.faiss_index.search(q_emb, top_k)
-        dense_hits = [
-            self.chunks[idx]["chunk_id"]
-            for idx in faiss_indices[0]
-            if 0 <= idx < len(self.chunks)
-        ]
+        if q_emb is not None and q_emb.shape[1] == self.faiss_index.d:
+            _, faiss_indices = self.faiss_index.search(q_emb, top_k)
+            dense_hits = [
+                self.chunks[idx]["chunk_id"]
+                for idx in faiss_indices[0]
+                if 0 <= idx < len(self.chunks)
+            ]
 
         # 2. Лексический поиск (BM25)
         lexical_query = query
@@ -116,7 +121,7 @@ class LegalRetriever:
             if bm_scores[idx] > 0
         ]
 
-        # 3. Слияние списков через Reciprocal Rank Fusion (RRF, k=60)
+        # 3. Слияние списков через Reciprocal Rank Fusion (RRF)
         rrf_scores: Dict[str, float] = {}
         k_rrf = 60
         for rank, cid in enumerate(dense_hits):
@@ -128,7 +133,7 @@ class LegalRetriever:
         if not seed_ids:
             return []
 
-        # 4. Графовое расширение (Graph Expansion) по связям из chunks_and_graph.json
+        # 4. Графовое расширение (Graph Expansion)
         expanded_ids = list(seed_ids)
         active_docs = {self.chunk_map[cid]["doc_id"] for cid in seed_ids if cid in self.chunk_map}
 
@@ -139,59 +144,50 @@ class LegalRetriever:
                     if cid not in expanded_ids:
                         expanded_ids.append(cid)
             elif edge["target_doc"] in active_docs:
-                for cid in edge["source_chunks"][:2]:
+                for cid in edge["source_chunks"][:3]:
                     if cid not in expanded_ids:
                         expanded_ids.append(cid)
 
-        # Ребро VERSIONS (редакции регламентов и связанные письма по target_date)
+        # Ребро VERSIONS (оба регламента 2023 и 2025 + письмо комплаенса К-12)
         for v_edge in self.graph.get("VERSIONS", []):
             v_docs = {v_edge.get("reg_2023_doc"), v_edge.get("reg_2025_doc"), v_edge.get("letter_k12_doc")}
             if active_docs.intersection(v_docs):
                 for cid in v_edge.get("letter_k12_chunks", []):
                     if cid not in expanded_ids:
                         expanded_ids.append(cid)
-
-                switch_date = v_edge.get("switch_date", "2025-03-01")
-                if target_date and target_date < switch_date:
+                # Всегда добавляем шапки обеих редакций регламента, чтобы модель точно знала даты
+                for cid in v_edge.get("reg_2023_chunks", [])[:2] + v_edge.get("reg_2025_chunks", [])[:2]:
+                    if cid not in expanded_ids:
+                        expanded_ids.append(cid)
+                if target_date and target_date < v_edge.get("switch_date", "2025-03-01"):
                     for cid in v_edge.get("reg_2023_chunks", []):
                         if cid not in expanded_ids:
                             expanded_ids.append(cid)
-                else:
-                    for cid in v_edge.get("reg_2025_chunks", [])[:4]:
-                        if cid not in expanded_ids:
-                            expanded_ids.append(cid)
 
-        # Ребро LAW_NOTES (статьи законов <-> шапка с датами редакций и примечания)
+        # Ребро LAW_NOTES (шапка закона с датой редакции и примечания к статье)
         for l_edge in self.graph.get("LAW_NOTES", []):
             if l_edge["law_doc"] in active_docs:
                 for cid in l_edge["header_and_notes_chunks"]:
                     if cid not in expanded_ids:
                         expanded_ids.append(cid)
 
-        # Соседний чанк с информацией о дате изменения части закона
+        # Захват соседнего чанка (на случай если заметка об изменении части закона оказалась в предыдущем чанке)
         for cid in list(expanded_ids):
-            ch = self.chunk_map.get(cid)
-            if ch and any(w in ch["doc_id"].lower() for w in ["закон", "коап", "фз", "нк_", "тк_", "гк_"]):
-                if ch["chunk_index"] > 0:
-                    prev_id = f"{ch['doc_id']}::chunk_{ch['chunk_index'] - 1}"
-                    if prev_id in self.chunk_map and prev_id not in expanded_ids:
-                        expanded_ids.append(prev_id)
-
-        # Исключаем короткие технические чанки-заголовки разделов ("1. Предмет договора")
-        candidates = []
-        for cid in expanded_ids:
             ch = self.chunk_map.get(cid)
             if not ch:
                 continue
-            raw_txt = ch["raw_text"].strip()
-            is_law_edition_note = any(w in raw_txt.lower() for w in ["изменен", "дополнен", "утратил силу"])
-            if len(raw_txt) > 35 or is_law_edition_note:
-                candidates.append(dict(ch))
+            if ch["chunk_index"] > 0:
+                prev_id = f"{ch['doc_id']}::chunk_{ch['chunk_index'] - 1}"
+                if prev_id in self.chunk_map and prev_id not in expanded_ids:
+                    prev_txt = self.chunk_map[prev_id]["raw_text"].lower()
+                    if any(w in prev_txt for w in ["изменен", "дополнен", "утратил силу", "в редакции"]):
+                        expanded_ids.append(prev_id)
 
+        candidates = [dict(self.chunk_map[cid]) for cid in expanded_ids if cid in self.chunk_map]
         if not candidates:
             return []
 
-        # 5. Вызов Qwen3 Reranker 8B через прокси организаторов
+        # 5. Реранкинг через Qwen3 Reranker 8B с сохранением RRF-бонуса для графовых чанков
         doc_payload = [c["contextual_text"] for c in candidates]
         try:
             res_data = self._post_with_retry(
@@ -211,18 +207,20 @@ class LegalRetriever:
             scores = [score_map.get(i, 0.0) for i in range(len(candidates))]
             is_reranker_active = True
         except Exception:
-            # На случай, если прокси реранкера недоступен
-            scores = [rrf_scores.get(c["chunk_id"], 0.01) for c in candidates]
+            scores = [rrf_scores.get(c["chunk_id"], 0.05) * 10.0 for c in candidates]
             is_reranker_active = False
 
         for ch, sc in zip(candidates, scores):
-            ch["rerank_score"] = round(float(sc), 4)
-            ch["spotlighted_xml"] = (
-                f'<document_evidence id="{ch["chunk_id"]}" source="{ch["doc_id"]}" '
-                f'clause="{ch["clause_id"]}" status="{ch["status"]}">\n'
-                f'{ch["contextual_text"]}\n'
-                f'</document_evidence>'
-            )
+            # Даем небольшой бонус критическим дополнениям (ДС №1, Письмо К-12, примечания к законам),
+            # чтобы реранкер не выкинул их из топ-N
+            bonus = 0.0
+            doc_lower = ch["doc_id"].lower()
+            raw_lower = ch["raw_text"].lower()
+            if "доп соглашение" in doc_lower or "к-12" in doc_lower:
+                bonus = 0.15
+            elif any(w in raw_lower for w in ["изменен с", "дополнен", "примечания:", "утратил силу с"]):
+                bonus = 0.10
+            ch["rerank_score"] = round(float(sc) + bonus, 4)
 
         candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
 
